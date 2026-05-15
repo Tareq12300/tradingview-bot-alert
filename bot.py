@@ -1,495 +1,323 @@
-# -*- coding: utf-8 -*-
-
 import os
 import time
-import json
-import math
-import logging
-from datetime import datetime, timezone
-
+import threading
 import requests
 import pandas as pd
-from flask import Flask, jsonify
-
-BOT_NAME = "بوت أبو علاوي للتنبيهات"
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-CMC_API_KEY = os.getenv("CMC_API_KEY", "").strip()
-
-TIMEFRAME = "4h"
-THRESHOLD = 0
-RSI_LENGTH = 14
-
-STOP_LOSS_PERCENT = 20
-TAKE_PROFIT_PERCENT = 40
-
-SCAN_INTERVAL_SECONDS = 900
-KLINE_LIMIT = 200
-
-CMC_LIMIT = 1000
-CMC_MAX_RANK = 1000
-CMC_MIN_MARKET_CAP = 0
-
-ENABLE_LONG = True
-
-PORT = int(os.getenv("PORT", "8080"))
-ALERTS_FILE = "sent_alerts.json"
+from flask import Flask
 
 app = Flask(__name__)
-SESSION = requests.Session()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s — %(levelname)s — %(message)s"
-)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+CMC_API_KEY = os.getenv("CMC_API_KEY")
 
+INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "60"))
+RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
+RSI_MAX = float(os.getenv("RSI_MAX", "20"))
+TOP_LIMIT = int(os.getenv("TOP_LIMIT", "1000"))
 
-def now_utc():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+CMC_BASE = "https://pro-api.coinmarketcap.com"
 
+EXCLUDED_KEYWORDS = [
+    "meme", "memes", "dog", "cat",
+    "gaming", "gamefi", "games", "play-to-earn", "p2e",
+    "gambling", "betting", "casino", "lottery",
+    "metaverse", "nft", "fan-token"
+]
 
-def safe_float(x):
-    try:
-        v = float(x)
-        if math.isnan(v) or math.isinf(v):
-            return None
-        return v
-    except:
-        return None
+EXCHANGES = {
+    "Binance": "https://api.binance.com/api/v3/klines",
+    "OKX": "https://www.okx.com/api/v5/market/candles",
+    "Bybit": "https://api.bybit.com/v5/market/kline",
+    "Gate": "https://api.gateio.ws/api/v4/spot/candlesticks",
+    "Bitget": "https://api.bitget.com/api/v2/spot/market/candles",
+}
 
-
-def load_sent_alerts():
-    if not os.path.exists(ALERTS_FILE):
-        return {}
-
-    try:
-        with open(ALERTS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except:
-        return {}
+sent_alerts = set()
 
 
-def save_sent_alerts(data):
-    try:
-        if len(data) > 5000:
-            data = dict(list(data.items())[-3000:])
-
-        with open(ALERTS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except:
-        pass
+@app.route("/")
+def home():
+    return "RSI Oversold CMC Telegram Bot is running"
 
 
 def send_telegram(text):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.warning("Telegram token/chat id missing")
-        return False
-
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "parse_mode": "Markdown",
         "disable_web_page_preview": True
     }
-
     try:
-        r = SESSION.post(url, json=payload, timeout=20)
-        return r.status_code == 200
+        requests.post(url, json=payload, timeout=20)
     except Exception as e:
-        logging.warning(f"Telegram error: {e}")
-        return False
+        print("Telegram error:", e)
 
 
-def send_welcome_message():
-    msg = (
-        f"🚀 *أهلاً بك في بوت أبو علاوي للتنبيهات*\n\n"
-        f"✅ البوت يعمل الآن بنجاح\n"
-        f"📊 تحليل العملات الرقمية تلقائياً\n"
-        f"📈 إشارات شراء فقط عند RSI أقل من 30\n"
-        f"🕓 الفريم: `{TIMEFRAME}`\n"
-        f"🏦 المنصة: `OKX`\n"
-        f"🌐 المصدر الإضافي: `CoinMarketCap`\n\n"
-        f"⚡ يتم فحص السوق وإرسال التنبيهات تلقائياً\n"
-        f"🔥 بالتوفيق للجميع\n\n"
-        f"`{now_utc()}`"
-    )
-
-    send_telegram(msg)
-
-
-def calc_rsi(close, length=14):
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    avg_gain = gain.ewm(
-        alpha=1 / length,
-        min_periods=length,
-        adjust=False
-    ).mean()
-
-    avg_loss = loss.ewm(
-        alpha=1 / length,
-        min_periods=length,
-        adjust=False
-    ).mean()
-
-    rs = avg_gain / avg_loss.replace(0, pd.NA)
-    rsi = 100 - (100 / (1 + rs))
-
-    return rsi.astype(float)
-
-
-def get_cmc_symbols_and_data():
-    url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
-
-    headers = {
+def cmc_headers():
+    return {
+        "Accepts": "application/json",
         "X-CMC_PRO_API_KEY": CMC_API_KEY
     }
 
+
+def get_top_cryptos():
+    url = f"{CMC_BASE}/v1/cryptocurrency/listings/latest"
     params = {
         "start": 1,
-        "limit": CMC_LIMIT,
+        "limit": TOP_LIMIT,
         "convert": "USD",
         "sort": "market_cap"
     }
 
-    out = {}
+    r = requests.get(url, headers=cmc_headers(), params=params, timeout=30)
+    r.raise_for_status()
+    return r.json().get("data", [])
+
+
+def get_crypto_info(ids):
+    if not ids:
+        return {}
+
+    url = f"{CMC_BASE}/v2/cryptocurrency/info"
+    params = {"id": ",".join(map(str, ids))}
+
+    r = requests.get(url, headers=cmc_headers(), params=params, timeout=30)
+    r.raise_for_status()
+    return r.json().get("data", {})
+
+
+def is_excluded_coin(coin, info):
+    text_parts = []
+
+    text_parts.append(str(coin.get("name", "")))
+    text_parts.append(str(coin.get("symbol", "")))
+
+    tags = coin.get("tags") or []
+    text_parts.extend(tags)
+
+    if info:
+        text_parts.append(str(info.get("name", "")))
+        text_parts.append(str(info.get("description", "")))
+        text_parts.extend(info.get("tags") or [])
+        category = info.get("category")
+        if category:
+            text_parts.append(str(category))
+
+    text = " ".join(text_parts).lower()
+
+    return any(word in text for word in EXCLUDED_KEYWORDS)
+
+
+def calculate_rsi(closes, period=14):
+    series = pd.Series(closes, dtype="float64")
+
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+
+    return float(rsi.iloc[-1])
+
+
+def fetch_binance(symbol):
+    params = {
+        "symbol": f"{symbol}USDT",
+        "interval": "4h",
+        "limit": 120
+    }
+    r = requests.get(EXCHANGES["Binance"], params=params, timeout=15)
+    if r.status_code != 200:
+        return None
+    data = r.json()
+    return [float(x[4]) for x in data]
+
+
+def fetch_okx(symbol):
+    params = {
+        "instId": f"{symbol}-USDT",
+        "bar": "4H",
+        "limit": 120
+    }
+    r = requests.get(EXCHANGES["OKX"], params=params, timeout=15)
+    if r.status_code != 200:
+        return None
+    data = r.json().get("data", [])
+    if not data:
+        return None
+    data.reverse()
+    return [float(x[4]) for x in data]
+
+
+def fetch_bybit(symbol):
+    params = {
+        "category": "spot",
+        "symbol": f"{symbol}USDT",
+        "interval": "240",
+        "limit": 120
+    }
+    r = requests.get(EXCHANGES["Bybit"], params=params, timeout=15)
+    if r.status_code != 200:
+        return None
+    data = r.json().get("result", {}).get("list", [])
+    if not data:
+        return None
+    data.reverse()
+    return [float(x[4]) for x in data]
+
+
+def fetch_gate(symbol):
+    params = {
+        "currency_pair": f"{symbol}_USDT",
+        "interval": "4h",
+        "limit": 120
+    }
+    r = requests.get(EXCHANGES["Gate"], params=params, timeout=15)
+    if r.status_code != 200:
+        return None
+    data = r.json()
+    if not data:
+        return None
+    return [float(x[2]) for x in data]
+
+
+def fetch_bitget(symbol):
+    params = {
+        "symbol": f"{symbol}USDT",
+        "granularity": "4H",
+        "limit": 120
+    }
+    r = requests.get(EXCHANGES["Bitget"], params=params, timeout=15)
+    if r.status_code != 200:
+        return None
+    data = r.json().get("data", [])
+    if not data:
+        return None
+    return [float(x[4]) for x in data]
+
+
+def get_centralized_exchange_data(symbol):
+    fetchers = {
+        "Binance": fetch_binance,
+        "OKX": fetch_okx,
+        "Bybit": fetch_bybit,
+        "Gate": fetch_gate,
+        "Bitget": fetch_bitget,
+    }
+
+    for exchange, func in fetchers.items():
+        try:
+            closes = func(symbol)
+            if closes and len(closes) >= RSI_PERIOD + 5:
+                return exchange, closes
+        except Exception:
+            continue
+
+    return None, None
+
+
+def short_description(info):
+    desc = info.get("description", "") if info else ""
+    if not desc:
+        return "لا يوجد وصف متاح من CoinMarketCap."
+
+    desc = desc.replace("\n", " ").strip()
+    words = desc.split()
+
+    return " ".join(words[:28]) + ("..." if len(words) > 28 else "")
+
+
+def format_alert(coin, info, exchange, rsi):
+    name = coin.get("name", "-")
+    symbol = coin.get("symbol", "-")
+    rank = coin.get("cmc_rank", "-")
+
+    quote = coin.get("quote", {}).get("USD", {})
+    price = quote.get("price", 0)
+    market_cap = quote.get("market_cap", 0)
+    volume_24h = quote.get("volume_24h", 0)
+
+    desc = short_description(info)
+
+    return f"""
+🚨 *تشبع بيعي قوي*
+
+*العملة:* {name} `({symbol})`
+*الترتيب:* #{rank}
+*المنصة المركزية:* {exchange}
+*RSI 4H:* `{rsi:.2f}`
+
+*السعر:* `${price:,.6f}`
+*Market Cap:* `${market_cap:,.0f}`
+*Volume 24H:* `${volume_24h:,.0f}`
+
+*تعريف مختصر:*
+{desc}
+
+⚠️ ليست توصية شراء، فقط تنبيه فني لوجود RSI أقل من {RSI_MAX}.
+""".strip()
+
+
+def run_scan():
+    print("Starting scan...")
 
     try:
-        r = SESSION.get(url, headers=headers, params=params, timeout=30)
-        r.raise_for_status()
+        coins = get_top_cryptos()
+        ids = [coin["id"] for coin in coins]
+        info_map = get_crypto_info(ids)
 
-        data = r.json().get("data", [])
+        print(f"Loaded {len(coins)} coins from CMC")
 
-        for item in data:
-            symbol = item.get("symbol", "").upper()
-            rank = int(item.get("cmc_rank") or 999999)
-
-            quote = item.get("quote", {}).get("USD", {})
-            market_cap = float(quote.get("market_cap") or 0)
-            volume_24h = float(quote.get("volume_24h") or 0)
+        for index, coin in enumerate(coins, start=1):
+            symbol = coin.get("symbol", "").upper()
+            coin_id = str(coin.get("id"))
+            info = info_map.get(coin_id, {})
 
             if not symbol:
                 continue
 
-            if rank > CMC_MAX_RANK:
+            if is_excluded_coin(coin, info):
                 continue
 
-            if market_cap < CMC_MIN_MARKET_CAP:
+            exchange, closes = get_centralized_exchange_data(symbol)
+
+            if not exchange:
                 continue
 
-            out[symbol] = {
-                "market_cap": market_cap,
-                "volume_24h": volume_24h,
-                "rank": rank
-            }
+            rsi = calculate_rsi(closes, RSI_PERIOD)
 
-        logging.info(f"CMC symbols loaded: {len(out)}")
-        return out
+            if rsi < RSI_MAX:
+                alert_key = f"{symbol}-{exchange}"
 
-    except Exception as e:
-        logging.warning(f"CMC failed: {e}")
-        return {}
+                if alert_key not in sent_alerts:
+                    msg = format_alert(coin, info, exchange, rsi)
+                    send_telegram(msg)
+                    sent_alerts.add(alert_key)
+                    print(f"Alert sent: {symbol} RSI={rsi:.2f} Exchange={exchange}")
 
-
-def get_okx_pairs():
-    url = "https://www.okx.com/api/v5/public/instruments"
-
-    params = {
-        "instType": "SPOT"
-    }
-
-    out = {}
-
-    try:
-        r = SESSION.get(url, params=params, timeout=30)
-        r.raise_for_status()
-
-        for item in r.json().get("data", []):
-            if item.get("quoteCcy") == "USDT" and item.get("state") == "live":
-                base = item.get("baseCcy", "").upper()
-                inst_id = item.get("instId", "")
-
-                if base and inst_id:
-                    out[base] = inst_id
-
-        logging.info(f"OKX pairs loaded: {len(out)}")
+            time.sleep(0.25)
 
     except Exception as e:
-        logging.warning(f"OKX pairs failed: {e}")
+        print("Scan error:", e)
+        send_telegram(f"⚠️ خطأ في البوت:\n`{e}`")
 
-    return out
 
-
-def normalize_ohlcv(rows):
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(
-        rows,
-        columns=["ts", "open", "high", "low", "close", "volume"]
-    )
-
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df["ts"] = pd.to_numeric(df["ts"], errors="coerce")
-    df = df.dropna(subset=["ts", "open", "high", "low", "close"])
-    df = df.sort_values("ts").reset_index(drop=True)
-
-    return df
-
-
-def fetch_okx_klines(pair, tf="4h", limit=200):
-    if tf == "4h":
-        bar = "4H"
-    else:
-        bar = "1D"
-
-    url = "https://www.okx.com/api/v5/market/candles"
-
-    params = {
-        "instId": pair,
-        "bar": bar,
-        "limit": str(limit)
-    }
-
-    r = SESSION.get(url, params=params, timeout=20)
-    r.raise_for_status()
-
-    raw = r.json().get("data", [])
-
-    rows = []
-
-    for x in raw:
-        rows.append([
-            x[0],
-            x[1],
-            x[2],
-            x[3],
-            x[4],
-            x[5]
-        ])
-
-    return normalize_ohlcv(rows)
-
-
-def fetch_daily_diff(pair):
-    try:
-        df = fetch_okx_klines(pair, "1d", 5)
-
-        if len(df) < 2:
-            return None
-
-        today = safe_float(df.iloc[-1]["close"])
-        yesterday = safe_float(df.iloc[-2]["close"])
-
-        if today is None or yesterday is None:
-            return None
-
-        if yesterday == 0:
-            return None
-
-        return (today - yesterday) / yesterday
-
-    except:
-        return None
-
-
-def analyze_symbol(symbol, pair, cmc_info):
-    try:
-        df = fetch_okx_klines(pair, TIMEFRAME, KLINE_LIMIT)
-
-        if df.empty or len(df) < RSI_LENGTH + 5:
-            return None
-
-        df["rsi"] = calc_rsi(df["close"], RSI_LENGTH)
-
-        price = safe_float(df.iloc[-1]["close"])
-        rsi = safe_float(df.iloc[-1]["rsi"])
-        candle_ts = int(df.iloc[-1]["ts"])
-
-        if price is None or rsi is None:
-            return None
-
-        close_diff = fetch_daily_diff(pair)
-
-        if close_diff is None:
-            return None
-
-        buying = close_diff > THRESHOLD
-
-        long_condition = (
-            ENABLE_LONG and
-            buying and
-            rsi < 30
-        )
-
-        if not long_condition:
-            return None
-
-        stop = price * (1 - STOP_LOSS_PERCENT / 100)
-        take = price * (1 + TAKE_PROFIT_PERCENT / 100)
-
-        return {
-            "symbol": symbol,
-            "price": price,
-            "rsi": rsi,
-            "close_diff": close_diff,
-            "stop": stop,
-            "take": take,
-            "market_cap": cmc_info.get("market_cap", 0),
-            "volume_24h": cmc_info.get("volume_24h", 0),
-            "rank": cmc_info.get("rank", "-"),
-            "candle_ts": candle_ts
-        }
-
-    except Exception as e:
-        logging.warning(f"{symbol} failed: {e}")
-        return None
-
-
-def format_money(value):
-    try:
-        value = float(value)
-
-        if value >= 1_000_000_000:
-            return f"${value / 1_000_000_000:,.2f}B"
-
-        if value >= 1_000_000:
-            return f"${value / 1_000_000:,.2f}M"
-
-        if value >= 1_000:
-            return f"${value / 1_000:,.2f}K"
-
-        return f"${value:,.2f}"
-
-    except:
-        return "$0"
-
-
-def format_signal_message(sig):
-    diff_pct = sig["close_diff"] * 100
-
-    return (
-        f"🟢 *إشارة شراء قوية*\n\n"
-        f"💎 *العملة:* `{sig['symbol']}USDT`\n"
-        f"🏦 *المنصة:* `OKX`\n"
-        f"🕓 *الفريم:* `4H`\n"
-        f"🏅 *CMC Rank:* `{sig['rank']}`\n\n"
-        f"💰 *السعر الحالي:* `{sig['price']:.8f}`\n"
-        f"📈 *RSI:* `{sig['rsi']:.2f}`\n"
-        f"📊 *فرق الإغلاق اليومي:* `{diff_pct:.2f}%`\n\n"
-        f"🏛 *Market Cap:* `{format_money(sig['market_cap'])}`\n"
-        f"📦 *24H Volume:* `{format_money(sig['volume_24h'])}`\n\n"
-        f"🛑 *وقف الخسارة:* `{sig['stop']:.8f}`\n"
-        f"🎯 *جني الأرباح:* `{sig['take']:.8f}`\n\n"
-        f"🚀 *تم اكتشاف فرصة شراء مطابقة للشروط*\n\n"
-        f"`{now_utc()}`"
-    )
-
-
-def scan_once():
-    sent_alerts = load_sent_alerts()
-
-    cmc_data = get_cmc_symbols_and_data()
-
-    if not cmc_data:
-        logging.warning("No CMC data loaded")
-        return
-
-    okx_pairs = get_okx_pairs()
-
-    final_pairs = {}
-
-    for symbol in cmc_data.keys():
-        if symbol in okx_pairs:
-            final_pairs[symbol] = okx_pairs[symbol]
-
-    logging.info(f"Final OKX watchlist: {len(final_pairs)}")
-
-    total = len(final_pairs)
-
-    for index, (symbol, pair) in enumerate(final_pairs.items(), start=1):
-        logging.info(f"[{index}/{total}] تحليل {symbol}")
-
-        sig = analyze_symbol(
-            symbol=symbol,
-            pair=pair,
-            cmc_info=cmc_data.get(symbol, {})
-        )
-
-        if not sig:
-            continue
-
-        current_candle = int(sig["candle_ts"] / (4 * 60 * 60 * 1000))
-
-        alert_key = f"{symbol}_OKX_4H_LONG_{current_candle}"
-
-        if alert_key in sent_alerts:
-            continue
-
-        msg = format_signal_message(sig)
-
-        ok = send_telegram(msg)
-
-        if ok:
-            sent_alerts[alert_key] = now_utc()
-            save_sent_alerts(sent_alerts)
-            logging.info(f"Signal sent: {symbol}")
-
-        time.sleep(0.25)
-
-
-@app.route("/")
-def home():
-    return jsonify({
-        "ok": True,
-        "bot": BOT_NAME,
-        "time": now_utc()
-    })
-
-
-@app.route("/health")
-def health():
-    return jsonify({
-        "ok": True,
-        "time": now_utc()
-    })
-
-
-def main():
-    logging.info(f"{BOT_NAME} Started")
-
-    send_welcome_message()
-
+def bot_loop():
+    send_telegram("🤖 بوت تشبع RSI أقل من 20 بدأ العمل.")
     while True:
-        try:
-            scan_once()
-            logging.info(f"Sleeping {SCAN_INTERVAL_SECONDS}s")
-            time.sleep(SCAN_INTERVAL_SECONDS)
+        run_scan()
+        time.sleep(INTERVAL_MINUTES * 60)
 
-        except Exception as e:
-            logging.exception(e)
-            send_telegram(f"⚠️ *Bot Error*\n`{str(e)[:500]}`")
-            time.sleep(60)
+
+threading.Thread(target=bot_loop, daemon=True).start()
 
 
 if __name__ == "__main__":
-    import threading
-
-    threading.Thread(
-        target=lambda: app.run(
-            host="0.0.0.0",
-            port=PORT,
-            debug=False,
-            use_reloader=False
-        ),
-        daemon=True
-    ).start()
-
-    main()
+    port = int(os.getenv("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)
