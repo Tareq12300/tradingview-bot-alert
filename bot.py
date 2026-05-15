@@ -1,6 +1,9 @@
 import os
 import time
+import csv
 import threading
+from datetime import datetime, timezone
+
 import requests
 import pandas as pd
 from flask import Flask
@@ -12,23 +15,41 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CMC_API_KEY = os.getenv("CMC_API_KEY")
 
 INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "60"))
-RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
-RSI_MAX = float(os.getenv("RSI_MAX", "20"))
 TOP_LIMIT = int(os.getenv("TOP_LIMIT", "1000"))
 
+STOCH_RSI_PERIOD = int(os.getenv("STOCH_RSI_PERIOD", "14"))
+STOCH_K_PERIOD = int(os.getenv("STOCH_K_PERIOD", "3"))
+STOCH_D_PERIOD = int(os.getenv("STOCH_D_PERIOD", "3"))
+
+STRONG_ALERT_LEVEL = float(os.getenv("STRONG_ALERT_LEVEL", "10"))
+WATCHLIST_LEVEL = float(os.getenv("WATCHLIST_LEVEL", "20"))
+RESET_LEVEL = float(os.getenv("RESET_LEVEL", "50"))
+
+MIN_MARKET_CAP = float(os.getenv("MIN_MARKET_CAP", "50000000"))
+MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H", "5000000"))
+MIN_PRICE_CHANGE_24H_ABS = float(os.getenv("MIN_PRICE_CHANGE_24H_ABS", "1"))
+
 CMC_BASE = "https://pro-api.coinmarketcap.com"
+SIGNALS_LOG = "signals_log.csv"
 
 EXCLUDED_KEYWORDS = [
-    "meme", "memes", "dog", "cat",
+    "meme", "memes", "dog", "cat", "pepe", "shib", "inu",
     "gaming", "gamefi", "games", "play-to-earn", "p2e",
     "gambling", "betting", "casino", "lottery",
     "metaverse", "nft", "fan-token",
-
     "tokenized", "xstock", "xstocks", "etf",
     "gold tokenized", "gold-backed", "silver-backed",
     "synthetic", "wrapped-stock", "wrapped stock",
     "leveraged", "inverse-etf", "commodity-backed",
     "stock token", "tokenized stock", "tokenized etf"
+]
+
+NEGATIVE_NEWS_KEYWORDS = [
+    "hack", "hacked", "exploit", "exploited",
+    "delisting", "delisted",
+    "lawsuit", "sec", "investigation",
+    "bankruptcy", "fraud", "scam",
+    "rug pull", "security breach"
 ]
 
 EXCHANGES = {
@@ -39,22 +60,26 @@ EXCHANGES = {
     "Bitget": "https://api.bitget.com/api/v2/spot/market/candles",
 }
 
-sent_alerts = set()
+alert_state = {}
 
 
 @app.route("/")
 def home():
-    return "RSI Oversold CMC Telegram Bot is running"
+    return "Stoch RSI CMC Telegram Bot is running"
 
 
 def send_telegram(text):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Missing Telegram variables")
+        return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
-        "parse_mode": "Markdown",
         "disable_web_page_preview": True
     }
+
     try:
         requests.post(url, json=payload, timeout=20)
     except Exception as e:
@@ -94,44 +119,108 @@ def get_crypto_info(ids):
     return r.json().get("data", {})
 
 
-def is_excluded_coin(coin, info):
-    text_parts = []
+def collect_coin_text(coin, info):
+    parts = [
+        str(coin.get("name", "")),
+        str(coin.get("symbol", "")),
+    ]
 
-    text_parts.append(str(coin.get("name", "")))
-    text_parts.append(str(coin.get("symbol", "")))
-
-    tags = coin.get("tags") or []
-    text_parts.extend(tags)
+    parts.extend(coin.get("tags") or [])
 
     if info:
-        text_parts.append(str(info.get("name", "")))
-        text_parts.append(str(info.get("symbol", "")))
-        text_parts.append(str(info.get("description", "")))
-        text_parts.extend(info.get("tags") or [])
+        parts.append(str(info.get("name", "")))
+        parts.append(str(info.get("symbol", "")))
+        parts.append(str(info.get("description", "")))
+        parts.extend(info.get("tags") or [])
 
-        category = info.get("category")
-        if category:
-            text_parts.append(str(category))
+        if info.get("category"):
+            parts.append(str(info.get("category")))
 
-    text = " ".join(text_parts).lower()
+    return " ".join(parts).lower()
 
+
+def is_excluded_coin(coin, info):
+    text = collect_coin_text(coin, info)
     return any(word in text for word in EXCLUDED_KEYWORDS)
 
 
-def calculate_rsi(closes, period=14):
+def has_negative_news_risk(coin, info):
+    text = collect_coin_text(coin, info)
+    return any(word in text for word in NEGATIVE_NEWS_KEYWORDS)
+
+
+def is_strong_project(coin):
+    quote = coin.get("quote", {}).get("USD", {})
+    market_cap = quote.get("market_cap") or 0
+    volume_24h = quote.get("volume_24h") or 0
+
+    return market_cap >= MIN_MARKET_CAP and volume_24h >= MIN_VOLUME_24H
+
+
+def is_dead_coin(coin, closes):
+    quote = coin.get("quote", {}).get("USD", {})
+    volume_24h = quote.get("volume_24h") or 0
+    market_cap = quote.get("market_cap") or 0
+    change_24h = abs(quote.get("percent_change_24h") or 0)
+
+    if market_cap < MIN_MARKET_CAP:
+        return True
+
+    if volume_24h < MIN_VOLUME_24H:
+        return True
+
+    if change_24h < MIN_PRICE_CHANGE_24H_ABS:
+        return True
+
+    if len(closes) >= 20:
+        recent = closes[-20:]
+        price_range = max(recent) - min(recent)
+        avg_price = sum(recent) / len(recent)
+
+        if avg_price > 0:
+            range_pct = (price_range / avg_price) * 100
+            if range_pct < 2:
+                return True
+
+    return False
+
+
+def calculate_stoch_rsi(closes):
     series = pd.Series(closes, dtype="float64")
 
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
 
-    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+    avg_gain = gain.ewm(alpha=1 / STOCH_RSI_PERIOD, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / STOCH_RSI_PERIOD, adjust=False).mean()
 
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
 
-    return float(rsi.iloc[-1])
+    lowest_rsi = rsi.rolling(STOCH_RSI_PERIOD).min()
+    highest_rsi = rsi.rolling(STOCH_RSI_PERIOD).max()
+
+    stoch_rsi = (rsi - lowest_rsi) / (highest_rsi - lowest_rsi) * 100
+    k = stoch_rsi.rolling(STOCH_K_PERIOD).mean()
+    d = k.rolling(STOCH_D_PERIOD).mean()
+
+    k = k.dropna()
+    d = d.dropna()
+
+    if len(k) < 2 or len(d) < 2:
+        return None
+
+    return {
+        "k": float(k.iloc[-1]),
+        "d": float(d.iloc[-1]),
+        "prev_k": float(k.iloc[-2]),
+        "prev_d": float(d.iloc[-2]),
+    }
+
+
+def bullish_cross(stoch):
+    return stoch["prev_k"] <= stoch["prev_d"] and stoch["k"] > stoch["d"]
 
 
 def fetch_binance(symbol):
@@ -140,11 +229,13 @@ def fetch_binance(symbol):
         "interval": "4h",
         "limit": 120
     }
+
     r = requests.get(EXCHANGES["Binance"], params=params, timeout=15)
+
     if r.status_code != 200:
         return None
-    data = r.json()
-    return [float(x[4]) for x in data]
+
+    return [float(x[4]) for x in r.json()]
 
 
 def fetch_okx(symbol):
@@ -153,12 +244,17 @@ def fetch_okx(symbol):
         "bar": "4H",
         "limit": 120
     }
+
     r = requests.get(EXCHANGES["OKX"], params=params, timeout=15)
+
     if r.status_code != 200:
         return None
+
     data = r.json().get("data", [])
+
     if not data:
         return None
+
     data.reverse()
     return [float(x[4]) for x in data]
 
@@ -170,12 +266,17 @@ def fetch_bybit(symbol):
         "interval": "240",
         "limit": 120
     }
+
     r = requests.get(EXCHANGES["Bybit"], params=params, timeout=15)
+
     if r.status_code != 200:
         return None
+
     data = r.json().get("result", {}).get("list", [])
+
     if not data:
         return None
+
     data.reverse()
     return [float(x[4]) for x in data]
 
@@ -186,12 +287,17 @@ def fetch_gate(symbol):
         "interval": "4h",
         "limit": 120
     }
+
     r = requests.get(EXCHANGES["Gate"], params=params, timeout=15)
+
     if r.status_code != 200:
         return None
+
     data = r.json()
+
     if not data:
         return None
+
     return [float(x[2]) for x in data]
 
 
@@ -201,12 +307,17 @@ def fetch_bitget(symbol):
         "granularity": "4H",
         "limit": 120
     }
+
     r = requests.get(EXCHANGES["Bitget"], params=params, timeout=15)
+
     if r.status_code != 200:
         return None
+
     data = r.json().get("data", [])
+
     if not data:
         return None
+
     return [float(x[4]) for x in data]
 
 
@@ -222,16 +333,19 @@ def get_centralized_exchange_data(symbol):
     for exchange, func in fetchers.items():
         try:
             closes = func(symbol)
-            if closes and len(closes) >= RSI_PERIOD + 5:
+
+            if closes and len(closes) >= 50:
                 return exchange, closes
-        except Exception:
-            continue
+
+        except Exception as e:
+            print(f"{exchange} failed for {symbol}: {e}")
 
     return None, None
 
 
 def short_description(info):
     desc = info.get("description", "") if info else ""
+
     if not desc:
         return "لا يوجد وصف متاح من CoinMarketCap."
 
@@ -241,7 +355,90 @@ def short_description(info):
     return " ".join(words[:28]) + ("..." if len(words) > 28 else "")
 
 
-def format_alert(coin, info, exchange, rsi):
+def confidence_score(stoch, coin, is_cross):
+    quote = coin.get("quote", {}).get("USD", {})
+    market_cap = quote.get("market_cap") or 0
+    volume_24h = quote.get("volume_24h") or 0
+
+    score = 50
+
+    if stoch["k"] <= 5:
+        score += 20
+    elif stoch["k"] <= 10:
+        score += 15
+    elif stoch["k"] <= 20:
+        score += 8
+
+    if is_cross:
+        score += 15
+
+    if volume_24h >= 20_000_000:
+        score += 10
+    elif volume_24h >= 5_000_000:
+        score += 5
+
+    if market_cap >= 500_000_000:
+        score += 10
+    elif market_cap >= 50_000_000:
+        score += 5
+
+    return min(score, 100)
+
+
+def log_signal(signal_type, coin, exchange, stoch, price):
+    file_exists = os.path.exists(SIGNALS_LOG)
+
+    with open(SIGNALS_LOG, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+
+        if not file_exists:
+            writer.writerow([
+                "time",
+                "signal_type",
+                "symbol",
+                "name",
+                "exchange",
+                "price",
+                "stoch_k",
+                "stoch_d"
+            ])
+
+        writer.writerow([
+            datetime.now(timezone.utc).isoformat(),
+            signal_type,
+            coin.get("symbol"),
+            coin.get("name"),
+            exchange,
+            price,
+            round(stoch["k"], 2),
+            round(stoch["d"], 2)
+        ])
+
+
+def can_send_alert(symbol, signal_type, stoch):
+    if symbol not in alert_state:
+        alert_state[symbol] = {
+            "last_signal": None,
+            "armed": True
+        }
+
+    state = alert_state[symbol]
+
+    if stoch["k"] >= RESET_LEVEL:
+        state["armed"] = True
+        state["last_signal"] = None
+        return False
+
+    if not state["armed"]:
+        return False
+
+    state["armed"] = False
+    state["last_signal"] = signal_type
+
+    return True
+
+
+def format_alert(signal_type, coin, info, exchange, stoch, score):
     name = coin.get("name", "-")
     symbol = coin.get("symbol", "-")
     rank = coin.get("cmc_rank", "-")
@@ -250,25 +447,36 @@ def format_alert(coin, info, exchange, rsi):
     price = quote.get("price", 0)
     market_cap = quote.get("market_cap", 0)
     volume_24h = quote.get("volume_24h", 0)
+    change_24h = quote.get("percent_change_24h", 0)
 
     desc = short_description(info)
 
+    title = "🚨 Strong Oversold Reversal" if signal_type == "STRONG" else "👀 Watchlist Oversold"
+
     return f"""
-🚨 تشبع بيعي قوي
+{title}
 
 العملة: {name} ({symbol})
 الترتيب: #{rank}
 المنصة المركزية: {exchange}
-RSI 4H: {rsi:.2f}
+الفريم: 4H
+
+Stoch RSI K: {stoch['k']:.2f}
+Stoch RSI D: {stoch['d']:.2f}
+Bullish Cross: {'نعم' if bullish_cross(stoch) else 'لا'}
+
+Confidence Score: {score}/100
 
 السعر: ${price:,.6f}
 Market Cap: ${market_cap:,.0f}
 Volume 24H: ${volume_24h:,.0f}
+24H Change: {change_24h:.2f}%
 
 تعريف مختصر:
 {desc}
 
-ليست توصية شراء، فقط تنبيه فني لوجود RSI أقل من {RSI_MAX}.
+ملاحظة:
+ليست توصية شراء، فقط تنبيه فني مبني على Stoch RSI والسيولة والفلاتر.
 """.strip()
 
 
@@ -291,7 +499,15 @@ def run_scan():
                 continue
 
             if is_excluded_coin(coin, info):
-                print(f"Excluded: {symbol}")
+                print(f"Excluded category: {symbol}")
+                continue
+
+            if has_negative_news_risk(coin, info):
+                print(f"Excluded negative risk: {symbol}")
+                continue
+
+            if not is_strong_project(coin):
+                print(f"Weak project: {symbol}")
                 continue
 
             exchange, closes = get_centralized_exchange_data(symbol)
@@ -299,16 +515,45 @@ def run_scan():
             if not exchange:
                 continue
 
-            rsi = calculate_rsi(closes, RSI_PERIOD)
+            if is_dead_coin(coin, closes):
+                print(f"Dead coin filter: {symbol}")
+                continue
 
-            if rsi < RSI_MAX:
-                alert_key = f"{symbol}-{exchange}"
+            stoch = calculate_stoch_rsi(closes)
 
-                if alert_key not in sent_alerts:
-                    msg = format_alert(coin, info, exchange, rsi)
+            if not stoch:
+                continue
+
+            is_cross = bullish_cross(stoch)
+            score = confidence_score(stoch, coin, is_cross)
+
+            quote = coin.get("quote", {}).get("USD", {})
+            price = quote.get("price", 0)
+
+            signal_type = None
+
+            if (
+                stoch["k"] <= STRONG_ALERT_LEVEL
+                and stoch["d"] <= STRONG_ALERT_LEVEL
+                and is_cross
+            ):
+                signal_type = "STRONG"
+
+            elif (
+                stoch["k"] <= WATCHLIST_LEVEL
+                and stoch["d"] <= WATCHLIST_LEVEL
+            ):
+                signal_type = "WATCHLIST"
+
+            if signal_type:
+                if can_send_alert(symbol, signal_type, stoch):
+                    msg = format_alert(signal_type, coin, info, exchange, stoch, score)
                     send_telegram(msg)
-                    sent_alerts.add(alert_key)
-                    print(f"Alert sent: {symbol} RSI={rsi:.2f} Exchange={exchange}")
+                    log_signal(signal_type, coin, exchange, stoch, price)
+                    print(
+                        f"{signal_type} sent: {symbol} "
+                        f"K={stoch['k']:.2f} D={stoch['d']:.2f}"
+                    )
 
             time.sleep(0.25)
 
@@ -318,7 +563,7 @@ def run_scan():
 
 
 def bot_loop():
-    send_telegram("بوت RSI أقل من 20 بدأ العمل.")
+    send_telegram("بوت Stoch RSI على فريم 4H بدأ العمل.")
     while True:
         run_scan()
         time.sleep(INTERVAL_MINUTES * 60)
