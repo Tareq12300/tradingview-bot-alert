@@ -4,7 +4,6 @@ import math
 import json
 import logging
 import threading
-from datetime import datetime, timezone
 
 import requests
 import pandas as pd
@@ -17,18 +16,21 @@ from flask import Flask
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "180"))  # seconds
-TIMEFRAME = os.getenv("TIMEFRAME", "4h")  # 15m, 1h, 4h
+ENABLE_WELCOME_MESSAGE = os.getenv("ENABLE_WELCOME_MESSAGE", "true").lower() == "true"
+
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "180"))
+TIMEFRAME = os.getenv("TIMEFRAME", "4h")
 CANDLE_LIMIT = int(os.getenv("CANDLE_LIMIT", "120"))
 
 MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "85"))
 MIN_VOLUME_24H_USD = float(os.getenv("MIN_VOLUME_24H_USD", "500000"))
 MIN_VOLUME_SPIKE_X = float(os.getenv("MIN_VOLUME_SPIKE_X", "2.5"))
+
 MIN_PRICE_CHANGE_24H = float(os.getenv("MIN_PRICE_CHANGE_24H", "-20"))
 MAX_PRICE_CHANGE_24H = float(os.getenv("MAX_PRICE_CHANGE_24H", "80"))
 
-MAX_MARKET_CAP_USD = float(os.getenv("MAX_MARKET_CAP_USD", "3000000000"))
 MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD", "1000000"))
+MAX_MARKET_CAP_USD = float(os.getenv("MAX_MARKET_CAP_USD", "3000000000"))
 
 COOLDOWN_HOURS = float(os.getenv("COOLDOWN_HOURS", "12"))
 MAX_SYMBOLS_PER_EXCHANGE = int(os.getenv("MAX_SYMBOLS_PER_EXCHANGE", "350"))
@@ -39,17 +41,17 @@ ENABLE_GATE = os.getenv("ENABLE_GATE", "true").lower() == "true"
 ENABLE_BITGET = os.getenv("ENABLE_BITGET", "true").lower() == "true"
 ENABLE_MEXC = os.getenv("ENABLE_MEXC", "true").lower() == "true"
 
-# CoinGecko is optional. Bot works without it, but market cap / categories become limited.
-COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "")
 ENABLE_COINGECKO_FILTERS = os.getenv("ENABLE_COINGECKO_FILTERS", "true").lower() == "true"
+COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "")
 
-# Not meme / not stable / not wallet / not ETF / not tokenized stocks
+STATE_FILE = "state.json"
+
 EXCLUDED_SYMBOLS = {
-    "USDT","USDC","DAI","FDUSD","TUSD","USDE","PYUSD","USDD","FRAX","LUSD","USD1",
-    "DOGE","SHIB","PEPE","BONK","WIF","FLOKI","BOME","MEME","DOGS","TURBO","BABYDOGE",
-    "CAT","MOG","BRETT","PONKE","MEW","POPCAT","NEIRO","SUNDOG","HIPPO","PNUT",
-    "TWT","SAFE","GLDX","XAUT","PAXG",
-    "BNB","JUP","SUI"
+    "USDT", "USDC", "DAI", "FDUSD", "TUSD", "USDE", "PYUSD", "USDD", "FRAX", "LUSD", "USD1",
+    "DOGE", "SHIB", "PEPE", "BONK", "WIF", "FLOKI", "BOME", "MEME", "DOGS", "TURBO", "BABYDOGE",
+    "CAT", "MOG", "BRETT", "PONKE", "MEW", "POPCAT", "NEIRO", "SUNDOG", "HIPPO", "PNUT",
+    "TWT", "SAFE", "GLDX", "XAUT", "PAXG",
+    "BNB", "JUP", "SUI"
 }
 
 EXCLUDED_KEYWORDS = [
@@ -59,19 +61,12 @@ EXCLUDED_KEYWORDS = [
     "XSTOCK", "ETF", "TOKENIZED", "STOCK"
 ]
 
-EXCLUDED_CG_CATEGORIES = [
-    "meme-token", "memes", "dog-themed-coins", "cat-themed-coins",
-    "stablecoins", "tokenized-stock", "asset-backed-tokens",
-    "wrapped-tokens", "wallets"
-]
-
-STATE_FILE = "state.json"
-
 # =========================
-# LOGGING / WEB SERVER
+# LOGGING / FLASK
 # =========================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s — %(levelname)s — %(message)s")
+
 app = Flask(__name__)
 
 @app.route("/")
@@ -79,26 +74,31 @@ def home():
     return {
         "ok": True,
         "bot": "Early Pump Scanner",
+        "binance": "disabled",
         "timeframe": TIMEFRAME,
         "scan_interval": SCAN_INTERVAL,
-        "binance": "disabled",
         "exchanges": enabled_exchanges()
     }
 
 def enabled_exchanges():
-    ex = []
-    if ENABLE_OKX: ex.append("OKX")
-    if ENABLE_BYBIT: ex.append("Bybit")
-    if ENABLE_GATE: ex.append("Gate")
-    if ENABLE_BITGET: ex.append("Bitget")
-    if ENABLE_MEXC: ex.append("MEXC")
-    return ex
+    exchanges = []
+    if ENABLE_OKX:
+        exchanges.append("OKX")
+    if ENABLE_BYBIT:
+        exchanges.append("Bybit")
+    if ENABLE_GATE:
+        exchanges.append("Gate")
+    if ENABLE_BITGET:
+        exchanges.append("Bitget")
+    if ENABLE_MEXC:
+        exchanges.append("MEXC")
+    return exchanges
 
 # =========================
 # HELPERS
 # =========================
 
-def request_json(url, params=None, headers=None, timeout=12):
+def request_json(url, params=None, headers=None, timeout=15):
     r = requests.get(url, params=params or {}, headers=headers or {}, timeout=timeout)
     r.raise_for_status()
     return r.json()
@@ -114,7 +114,7 @@ def safe_float(x, default=0.0):
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
-            with open(STATE_FILE, "r") as f:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             return {}
@@ -122,7 +122,7 @@ def load_state():
 
 def save_state(state):
     try:
-        with open(STATE_FILE, "w") as f:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
     except Exception as e:
         logging.warning(f"Could not save state: {e}")
@@ -131,15 +131,18 @@ def is_excluded_symbol(symbol):
     s = symbol.upper().replace("USDT", "").replace("_", "").replace("-", "").replace("/", "")
     if s in EXCLUDED_SYMBOLS:
         return True
-    for k in EXCLUDED_KEYWORDS:
-        if k in s:
+
+    for keyword in EXCLUDED_KEYWORDS:
+        if keyword in s:
             return True
+
     return False
 
 def send_telegram(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logging.warning("Telegram variables missing.")
         return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -147,19 +150,53 @@ def send_telegram(text):
         "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
+
     try:
         requests.post(url, json=payload, timeout=15).raise_for_status()
     except Exception as e:
         logging.error(f"Telegram send failed: {e}")
 
+def send_welcome_message():
+    if not ENABLE_WELCOME_MESSAGE:
+        return
+
+    msg = f"""🚀 <b>Early Pump Scanner Started</b>
+
+✅ Binance Disabled
+✅ Meme Coins Filtered
+✅ Stable Coins Filtered
+✅ CEX Spot Coins Only
+✅ Volume Spike Detection Active
+✅ Breakout Scanner Active
+✅ Momentum Scanner Active
+✅ Repeat Protection Active
+
+📊 <b>Monitoring:</b> 1000+ CEX Coins
+🏦 <b>Exchanges:</b> {", ".join(enabled_exchanges())}
+⏱ <b>Timeframe:</b> {TIMEFRAME}
+🔥 <b>Mode:</b> Early Explosion Detection
+
+📈 <b>Alert Includes:</b>
+• Current Volume
+• Average 20 Candles Volume
+• Volume Spike Ratio
+• Spike Increase %
+• Market Cap
+• 24H Volume
+• Confidence Score
+• Targets + Stop Loss"""
+    send_telegram(msg)
+
 def money(v):
     v = safe_float(v)
+
     if v >= 1_000_000_000:
-        return f"${v/1_000_000_000:.2f}B"
+        return f"${v / 1_000_000_000:.2f}B"
     if v >= 1_000_000:
-        return f"${v/1_000_000:.2f}M"
+        return f"${v / 1_000_000:.2f}M"
     if v >= 1_000:
-        return f"${v/1_000:.2f}K"
+        return f"${v / 1_000:.2f}K"
+
     return f"${v:.2f}"
 
 def pct(v):
@@ -172,6 +209,7 @@ def pct(v):
 def get_okx_symbols():
     data = request_json("https://www.okx.com/api/v5/public/instruments", {"instType": "SPOT"})
     rows = data.get("data", [])
+
     pairs = []
     for x in rows:
         inst = x.get("instId", "")
@@ -179,84 +217,105 @@ def get_okx_symbols():
             base = inst.replace("-USDT", "")
             if not is_excluded_symbol(base):
                 pairs.append({"exchange": "OKX", "symbol": base, "pair": inst})
+
     return pairs[:MAX_SYMBOLS_PER_EXCHANGE]
 
 def get_bybit_symbols():
     data = request_json("https://api.bybit.com/v5/market/instruments-info", {"category": "spot"})
     rows = data.get("result", {}).get("list", [])
+
     pairs = []
     for x in rows:
-        sym = x.get("symbol", "")
-        quote = x.get("quoteCoin", "")
         base = x.get("baseCoin", "")
+        quote = x.get("quoteCoin", "")
         status = x.get("status", "")
+        sym = x.get("symbol", "")
+
         if quote == "USDT" and status == "Trading" and not is_excluded_symbol(base):
             pairs.append({"exchange": "Bybit", "symbol": base, "pair": sym})
+
     return pairs[:MAX_SYMBOLS_PER_EXCHANGE]
 
 def get_gate_symbols():
     data = request_json("https://api.gateio.ws/api/v4/spot/currency_pairs")
+
     pairs = []
     for x in data:
         pair = x.get("id", "")
         base = x.get("base", "")
         quote = x.get("quote", "")
         trade_status = x.get("trade_status", "")
+
         if quote == "USDT" and trade_status == "tradable" and not is_excluded_symbol(base):
             pairs.append({"exchange": "Gate", "symbol": base, "pair": pair})
+
     return pairs[:MAX_SYMBOLS_PER_EXCHANGE]
 
 def get_bitget_symbols():
     data = request_json("https://api.bitget.com/api/v2/spot/public/symbols")
     rows = data.get("data", [])
+
     pairs = []
     for x in rows:
         base = x.get("baseCoin", "")
         quote = x.get("quoteCoin", "")
         status = x.get("status", "")
         sym = x.get("symbol", "")
+
         if quote == "USDT" and status == "online" and not is_excluded_symbol(base):
             pairs.append({"exchange": "Bitget", "symbol": base, "pair": sym})
+
     return pairs[:MAX_SYMBOLS_PER_EXCHANGE]
 
 def get_mexc_symbols():
     data = request_json("https://api.mexc.com/api/v3/exchangeInfo")
     rows = data.get("symbols", [])
+
     pairs = []
     for x in rows:
         base = x.get("baseAsset", "")
         quote = x.get("quoteAsset", "")
-        status = x.get("status", "")
+        status = str(x.get("status", ""))
         sym = x.get("symbol", "")
+
         if quote == "USDT" and status in ("1", "ENABLED", "TRADING") and not is_excluded_symbol(base):
             pairs.append({"exchange": "MEXC", "symbol": base, "pair": sym})
+
     return pairs[:MAX_SYMBOLS_PER_EXCHANGE]
 
 def get_all_symbols():
     all_pairs = []
     funcs = []
-    if ENABLE_OKX: funcs.append(get_okx_symbols)
-    if ENABLE_BYBIT: funcs.append(get_bybit_symbols)
-    if ENABLE_GATE: funcs.append(get_gate_symbols)
-    if ENABLE_BITGET: funcs.append(get_bitget_symbols)
-    if ENABLE_MEXC: funcs.append(get_mexc_symbols)
+
+    if ENABLE_OKX:
+        funcs.append(get_okx_symbols)
+    if ENABLE_BYBIT:
+        funcs.append(get_bybit_symbols)
+    if ENABLE_GATE:
+        funcs.append(get_gate_symbols)
+    if ENABLE_BITGET:
+        funcs.append(get_bitget_symbols)
+    if ENABLE_MEXC:
+        funcs.append(get_mexc_symbols)
 
     for fn in funcs:
         try:
             pairs = fn()
-            logging.info(f"{pairs[0]['exchange'] if pairs else fn.__name__}: {len(pairs)} pairs")
+            if pairs:
+                logging.info(f"{pairs[0]['exchange']}: {len(pairs)} pairs")
             all_pairs.extend(pairs)
         except Exception as e:
             logging.warning(f"Failed loading symbols from {fn.__name__}: {e}")
 
-    # keep exchange-specific pairs, but avoid exact duplicate pair on same exchange
     unique = []
     seen = set()
+
     for p in all_pairs:
         key = (p["exchange"], p["pair"])
         if key not in seen:
             unique.append(p)
             seen.add(key)
+
     logging.info(f"Total watchlist pairs: {len(unique)}")
     return unique
 
@@ -266,61 +325,103 @@ def get_all_symbols():
 
 def map_tf(exchange, tf):
     if exchange in ("OKX", "Gate", "Bitget"):
-        return {"15m":"15m","1h":"1H","4h":"4H"}.get(tf, "4H")
+        return {"15m": "15m", "1h": "1H", "4h": "4H"}.get(tf, "4H")
+
     if exchange == "Bybit":
-        return {"15m":"15","1h":"60","4h":"240"}.get(tf, "240")
+        return {"15m": "15", "1h": "60", "4h": "240"}.get(tf, "240")
+
     if exchange == "MEXC":
-        return {"15m":"15m","1h":"60m","4h":"4h"}.get(tf, "4h")
+        return {"15m": "15m", "1h": "60m", "4h": "4h"}.get(tf, "4h")
+
     return tf
 
 def fetch_candles(item):
-    ex, pair = item["exchange"], item["pair"]
+    ex = item["exchange"]
+    pair = item["pair"]
     tf = map_tf(ex, TIMEFRAME)
 
     if ex == "OKX":
-        data = request_json("https://www.okx.com/api/v5/market/candles", {"instId": pair, "bar": tf, "limit": CANDLE_LIMIT})
-        rows = data.get("data", [])
-        rows = list(reversed(rows))
+        data = request_json(
+            "https://www.okx.com/api/v5/market/candles",
+            {"instId": pair, "bar": tf, "limit": CANDLE_LIMIT}
+        )
+        rows = list(reversed(data.get("data", [])))
+
         return pd.DataFrame([{
-            "time": int(r[0]), "open": safe_float(r[1]), "high": safe_float(r[2]),
-            "low": safe_float(r[3]), "close": safe_float(r[4]), "volume": safe_float(r[7])
+            "time": int(r[0]),
+            "open": safe_float(r[1]),
+            "high": safe_float(r[2]),
+            "low": safe_float(r[3]),
+            "close": safe_float(r[4]),
+            "volume": safe_float(r[7])
         } for r in rows])
 
     if ex == "Bybit":
-        data = request_json("https://api.bybit.com/v5/market/kline", {"category": "spot", "symbol": pair, "interval": tf, "limit": CANDLE_LIMIT})
-        rows = data.get("result", {}).get("list", [])
-        rows = list(reversed(rows))
+        data = request_json(
+            "https://api.bybit.com/v5/market/kline",
+            {"category": "spot", "symbol": pair, "interval": tf, "limit": CANDLE_LIMIT}
+        )
+        rows = list(reversed(data.get("result", {}).get("list", [])))
+
         return pd.DataFrame([{
-            "time": int(r[0]), "open": safe_float(r[1]), "high": safe_float(r[2]),
-            "low": safe_float(r[3]), "close": safe_float(r[4]), "volume": safe_float(r[6])
+            "time": int(r[0]),
+            "open": safe_float(r[1]),
+            "high": safe_float(r[2]),
+            "low": safe_float(r[3]),
+            "close": safe_float(r[4]),
+            "volume": safe_float(r[6])
         } for r in rows])
 
     if ex == "Gate":
-        data = request_json("https://api.gateio.ws/api/v4/spot/candlesticks", {"currency_pair": pair, "interval": tf.lower(), "limit": CANDLE_LIMIT})
+        data = request_json(
+            "https://api.gateio.ws/api/v4/spot/candlesticks",
+            {"currency_pair": pair, "interval": tf.lower(), "limit": CANDLE_LIMIT}
+        )
+
         return pd.DataFrame([{
-            "time": int(r[0]), "volume": safe_float(r[1]), "close": safe_float(r[2]),
-            "high": safe_float(r[3]), "low": safe_float(r[4]), "open": safe_float(r[5])
+            "time": int(r[0]),
+            "volume": safe_float(r[1]),
+            "close": safe_float(r[2]),
+            "high": safe_float(r[3]),
+            "low": safe_float(r[4]),
+            "open": safe_float(r[5])
         } for r in data])
 
     if ex == "Bitget":
-        data = request_json("https://api.bitget.com/api/v2/spot/market/candles", {"symbol": pair, "granularity": tf, "limit": str(CANDLE_LIMIT)})
+        data = request_json(
+            "https://api.bitget.com/api/v2/spot/market/candles",
+            {"symbol": pair, "granularity": tf, "limit": str(CANDLE_LIMIT)}
+        )
         rows = data.get("data", [])
+
         return pd.DataFrame([{
-            "time": int(r[0]), "open": safe_float(r[1]), "high": safe_float(r[2]),
-            "low": safe_float(r[3]), "close": safe_float(r[4]), "volume": safe_float(r[6])
+            "time": int(r[0]),
+            "open": safe_float(r[1]),
+            "high": safe_float(r[2]),
+            "low": safe_float(r[3]),
+            "close": safe_float(r[4]),
+            "volume": safe_float(r[6])
         } for r in rows])
 
     if ex == "MEXC":
-        data = request_json("https://api.mexc.com/api/v3/klines", {"symbol": pair, "interval": tf, "limit": CANDLE_LIMIT})
+        data = request_json(
+            "https://api.mexc.com/api/v3/klines",
+            {"symbol": pair, "interval": tf, "limit": CANDLE_LIMIT}
+        )
+
         return pd.DataFrame([{
-            "time": int(r[0]), "open": safe_float(r[1]), "high": safe_float(r[2]),
-            "low": safe_float(r[3]), "close": safe_float(r[4]), "volume": safe_float(r[7])
+            "time": int(r[0]),
+            "open": safe_float(r[1]),
+            "high": safe_float(r[2]),
+            "low": safe_float(r[3]),
+            "close": safe_float(r[4]),
+            "volume": safe_float(r[7])
         } for r in data])
 
     return pd.DataFrame()
 
 # =========================
-# MARKET DATA
+# COINGECKO MARKET DATA
 # =========================
 
 cg_cache = {}
@@ -328,7 +429,9 @@ cg_last_load = 0
 
 def load_coingecko_markets():
     global cg_cache, cg_last_load
+
     now = time.time()
+
     if cg_cache and now - cg_last_load < 3600:
         return cg_cache
 
@@ -340,6 +443,7 @@ def load_coingecko_markets():
         headers["x-cg-demo-api-key"] = COINGECKO_API_KEY
 
     cache = {}
+
     try:
         for page in range(1, 6):
             data = request_json(
@@ -355,6 +459,7 @@ def load_coingecko_markets():
                 headers=headers,
                 timeout=20
             )
+
             for x in data:
                 sym = str(x.get("symbol", "")).upper()
                 if sym:
@@ -365,13 +470,16 @@ def load_coingecko_markets():
                         "name": x.get("name", ""),
                         "id": x.get("id", "")
                     }
+
             time.sleep(1.2)
+
         cg_cache = cache
         cg_last_load = now
         logging.info(f"CoinGecko markets loaded: {len(cg_cache)} symbols")
         return cg_cache
+
     except Exception as e:
-        logging.warning(f"CoinGecko failed, continuing without full market cap: {e}")
+        logging.warning(f"CoinGecko failed. Continuing without full market data: {e}")
         return cg_cache or {}
 
 def get_market_info(symbol):
@@ -389,6 +497,7 @@ def rsi(close, period=14):
     delta = close.diff()
     gain = delta.where(delta > 0, 0).rolling(period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+
     rs = gain / loss.replace(0, math.nan)
     return 100 - (100 / (1 + rs))
 
@@ -400,64 +509,77 @@ def macd(close):
     hist = line - signal
     return line, signal, hist
 
+# =========================
+# ANALYSIS
+# =========================
+
 def analyze(item):
     df = fetch_candles(item)
+
     if df.empty or len(df) < 50:
         return None
 
     df = df.dropna().copy()
+
     close = df["close"]
     high = df["high"]
     low = df["low"]
-    vol = df["volume"]
+    volume = df["volume"]
 
     last_close = safe_float(close.iloc[-1])
     prev_close = safe_float(close.iloc[-2])
+
     if last_close <= 0:
         return None
 
-    current_vol = safe_float(vol.iloc[-1])
-    avg20_vol = safe_float(vol.iloc[-21:-1].mean())
-    avg50_vol = safe_float(vol.iloc[-51:-1].mean()) if len(vol) >= 52 else avg20_vol
+    current_volume = safe_float(volume.iloc[-1])
+    avg20_volume = safe_float(volume.iloc[-21:-1].mean())
 
-    if avg20_vol <= 0:
+    if avg20_volume <= 0:
         return None
 
-    spike_x = current_vol / avg20_vol
+    spike_x = current_volume / avg20_volume
     spike_pct = (spike_x - 1) * 100
 
-    # Volume acceleration: last 3 candles average vs previous 10 average
-    last3_avg = safe_float(vol.iloc[-3:].mean())
-    prev10_avg = safe_float(vol.iloc[-13:-3].mean())
-    acceleration_x = last3_avg / prev10_avg if prev10_avg > 0 else 0
+    last3_avg_volume = safe_float(volume.iloc[-3:].mean())
+    prev10_avg_volume = safe_float(volume.iloc[-13:-3].mean())
+
+    acceleration_x = last3_avg_volume / prev10_avg_volume if prev10_avg_volume > 0 else 0
     acceleration_increasing = acceleration_x >= 1.4
 
     rsi_val = safe_float(rsi(close).iloc[-1])
+
     ema20 = safe_float(ema(close, 20).iloc[-1])
     ema50 = safe_float(ema(close, 50).iloc[-1])
-    ema200 = safe_float(ema(close, 200).iloc[-1]) if len(close) >= 200 else 0
 
     _, _, hist = macd(close)
+
     macd_hist = safe_float(hist.iloc[-1])
     macd_hist_prev = safe_float(hist.iloc[-2])
 
     resistance = safe_float(high.iloc[-31:-1].max())
-    breakout = last_close > resistance and current_vol > avg20_vol * 1.5
+    breakout = last_close > resistance and current_volume > avg20_volume * 1.5
 
-    price_change_24h = ((last_close - safe_float(close.iloc[-7])) / safe_float(close.iloc[-7]) * 100) if len(close) >= 7 else 0
+    price_change_24h_local = 0
+    if len(close) >= 7 and safe_float(close.iloc[-7]) > 0:
+        price_change_24h_local = ((last_close - safe_float(close.iloc[-7])) / safe_float(close.iloc[-7])) * 100
 
     market = get_market_info(item["symbol"])
+
     market_cap = safe_float(market.get("market_cap", 0))
     volume_24h = safe_float(market.get("volume_24h", 0))
-    cg_change_24h = safe_float(market.get("price_change_24h", price_change_24h))
+    price_change_24h = safe_float(market.get("price_change_24h", price_change_24h_local))
 
-    # Filters
+    # Main filters
     if volume_24h and volume_24h < MIN_VOLUME_24H_USD:
         return None
+
     if market_cap and (market_cap < MIN_MARKET_CAP_USD or market_cap > MAX_MARKET_CAP_USD):
         return None
-    if cg_change_24h < MIN_PRICE_CHANGE_24H or cg_change_24h > MAX_PRICE_CHANGE_24H:
+
+    if price_change_24h < MIN_PRICE_CHANGE_24H or price_change_24h > MAX_PRICE_CHANGE_24H:
         return None
+
     if spike_x < MIN_VOLUME_SPIKE_X:
         return None
 
@@ -496,7 +618,9 @@ def analyze(item):
 
     candle_body = abs(last_close - safe_float(df["open"].iloc[-1]))
     candle_range = max(safe_float(high.iloc[-1]) - safe_float(low.iloc[-1]), 1e-12)
-    strong_candle = (last_close > prev_close) and (candle_body / candle_range >= 0.45)
+
+    strong_candle = last_close > prev_close and (candle_body / candle_range >= 0.45)
+
     if strong_candle:
         score += 9
         reasons.append("Strong Buyer Candle")
@@ -505,12 +629,19 @@ def analyze(item):
         score += 5
         reasons.append("Good 24H Volume")
 
-    # Early explosion score cap
     confidence = min(score, 100)
+
     if confidence < MIN_CONFIDENCE:
         return None
 
-    spike_status = "Extreme" if spike_x >= 7 else "Strong" if spike_x >= 4 else "Good" if spike_x >= 2 else "Weak"
+    if spike_x >= 7:
+        spike_status = "Extreme"
+    elif spike_x >= 4:
+        spike_status = "Strong"
+    elif spike_x >= 2:
+        spike_status = "Good"
+    else:
+        spike_status = "Weak"
 
     return {
         "exchange": item["exchange"],
@@ -519,9 +650,9 @@ def analyze(item):
         "price": last_close,
         "market_cap": market_cap,
         "volume_24h": volume_24h,
-        "price_change_24h": cg_change_24h,
-        "current_volume": current_vol,
-        "avg20_volume": avg20_vol,
+        "price_change_24h": price_change_24h,
+        "current_volume": current_volume,
+        "avg20_volume": avg20_volume,
         "spike_x": spike_x,
         "spike_pct": spike_pct,
         "spike_status": spike_status,
@@ -533,8 +664,13 @@ def analyze(item):
         "reasons": reasons
     }
 
+# =========================
+# ALERT FORMAT
+# =========================
+
 def format_alert(s):
     price = s["price"]
+
     tp1 = price * 1.08
     tp2 = price * 1.15
     tp3 = price * 1.25
@@ -579,8 +715,13 @@ TP5: ${tp5:.8f} (+70%)
 
 ⚠️ ليست توصية مالية. استخدم إدارة مخاطر."""
 
+# =========================
+# SCANNER LOOP
+# =========================
+
 def scanner_loop():
-    send_telegram("✅ Early Pump Scanner Started\nBinance: Disabled\nMeme coins: Filtered\nMode: CEX Spot USDT")
+    send_welcome_message()
+
     state = load_state()
 
     while True:
@@ -593,19 +734,23 @@ def scanner_loop():
 
             for idx, item in enumerate(pairs, 1):
                 key = f"{item['exchange']}:{item['symbol']}"
+
                 last_sent = safe_float(state.get(key, 0))
+
                 if now - last_sent < COOLDOWN_HOURS * 3600:
                     continue
 
                 try:
                     logging.info(f"[{idx}/{len(pairs)}] {item['exchange']} {item['symbol']}")
-                    sig = analyze(item)
-                    if sig:
-                        send_telegram(format_alert(sig))
+                    signal = analyze(item)
+
+                    if signal:
+                        send_telegram(format_alert(signal))
                         state[key] = now
                         save_state(state)
                         sent += 1
                         time.sleep(1)
+
                 except Exception as e:
                     logging.warning(f"Analyze failed {item}: {e}")
 
@@ -617,6 +762,10 @@ def scanner_loop():
         except Exception as e:
             logging.error(f"Scanner loop error: {e}")
             time.sleep(30)
+
+# =========================
+# START
+# =========================
 
 if __name__ == "__main__":
     t = threading.Thread(target=scanner_loop, daemon=True)
